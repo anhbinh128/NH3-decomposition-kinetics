@@ -98,19 +98,23 @@ DH_RANGE_MULTIPLIER = 4
 R = 8.31446261815324
 EPS = 1e-16
 
-# param block per catalyst = [lnA, Ea, lnKH0, dH]
+# param block per catalyst = [lnA, Ea, lnKNH30, dH_NH3, lnKH20, dH_H2]
 LB_BLOCK = np.array([
     -100.0,   # lnA
     1e3,      # Ea (J/mol)
-    -80.0,    # lnKH0
-    -400e3    # dH (J/mol)
+    -80.0,    # lnKNH30
+    -400e3,   # dH_NH3 (J/mol)
+    -80.0,    # lnKH20
+    -400e3    # dH_H2 (J/mol)
 ], dtype=float)
 
 UB_BLOCK = np.array([
     100.0,    # lnA
     400e3,    # Ea (J/mol)
-    80.0,     # lnKH0
-    200e3     # dH (J/mol)
+    80.0,     # lnKNH30
+    200e3,    # dH_NH3 (J/mol)
+    80.0,     # lnKH20
+    200e3     # dH_H2 (J/mol)
 ], dtype=float)
 
 PARITY_DPI = 300
@@ -270,15 +274,15 @@ def parameter_se_from_result(res):
 
 
 def block_slice(cat_idx):
-    i0 = 4 * cat_idx
-    i1 = i0 + 4
+    i0 = 6 * cat_idx
+    i1 = i0 + 6
     return slice(i0, i1)
 
 
 def unpack_block(params, cat_idx):
     sl = block_slice(cat_idx)
-    lnA, Ea, lnKH0, dH = params[sl]
-    return lnA, Ea, lnKH0, dH
+    lnA, Ea, lnKNH30, dH_NH3, lnKH20, dH_H2 = params[sl]
+    return lnA, Ea, lnKNH30, dH_NH3, lnKH20, dH_H2
 
 
 def build_bounds_joint():
@@ -291,8 +295,8 @@ def k_of_T(lnA, Ea, T_K):
     return np.exp(np.clip(lnA - Ea / (R * T_K), -700, 700))
 
 
-def KH_of_T(lnKH0, dH, T_K):
-    return np.exp(np.clip(lnKH0 - dH / (R * T_K), -700, 700))
+def Kads_of_T(lnK0, dH, T_K):
+    return np.exp(np.clip(lnK0 - dH / (R * T_K), -700, 700))
 
 
 def initial_guess_joint(df):
@@ -310,16 +314,24 @@ def initial_guess_joint(df):
         lnA_guess = np.log(max(np.median(r), 1e-20)) + 100e3 / (R * tmid)
         Ea_guess = 100e3
 
+        pnh3_pos = PNH3[PNH3 > 0]
+        if len(pnh3_pos) > 0:
+            KNH3_guess = 1.0 / max(np.median(pnh3_pos), 1e-12)
+        else:
+            KNH3_guess = 1.0
+
         ph2_pos = PH2[PH2 > 0]
         if len(ph2_pos) > 0:
-            KH_guess = 1.0 / max(np.median(ph2_pos), 1e-12)
+            KH2_guess = 1.0 / max(np.median(ph2_pos), 1e-12)
         else:
-            KH_guess = 1.0
+            KH2_guess = 1.0
 
-        lnKH0_guess = np.log(np.clip(KH_guess, 1e-30, 1e30))
-        dH_guess = -90e3
+        lnKNH30_guess = np.log(np.clip(KNH3_guess, 1e-30, 1e30))
+        dH_NH3_guess = -90e3
+        lnKH20_guess = np.log(np.clip(KH2_guess, 1e-30, 1e30))
+        dH_H2_guess = -90e3
 
-        block = np.array([lnA_guess, Ea_guess, lnKH0_guess, dH_guess], dtype=float)
+        block = np.array([lnA_guess, Ea_guess, lnKNH30_guess, dH_NH3_guess, lnKH20_guess, dH_H2_guess], dtype=float)
         block = np.clip(block, LB_BLOCK, UB_BLOCK)
         parts.append(block)
 
@@ -382,6 +394,8 @@ def load_all_data():
 # MODEL (NO LAMBDA)
 # =========================================================
 def model_joint(params, cat_idx_arr, T_K, PNH3, PH2, m_fixed, n_fixed):
+    # New LH-type denominator:
+    # r = k * PNH3^m / (1 + KNH3*PNH3 + sqrt(KH2*PH2))^n
     r_pred = np.empty_like(T_K, dtype=float)
 
     for ci in range(len(CAT_ORDER)):
@@ -389,16 +403,19 @@ def model_joint(params, cat_idx_arr, T_K, PNH3, PH2, m_fixed, n_fixed):
         if not np.any(mask):
             continue
 
-        lnA, Ea, lnKH0, dH = unpack_block(params, ci)
+        lnA, Ea, lnKNH30, dH_NH3, lnKH20, dH_H2 = unpack_block(params, ci)
 
         ln_k = lnA - Ea / (R * T_K[mask])
-        ln_KH = lnKH0 - dH / (R * T_K[mask])
+        ln_KNH3 = lnKNH30 - dH_NH3 / (R * T_K[mask])
+        ln_KH2 = lnKH20 - dH_H2 / (R * T_K[mask])
 
         k = np.exp(np.clip(ln_k, -700, 700))
-        KH = np.exp(np.clip(ln_KH, -700, 700))
+        KNH3 = np.exp(np.clip(ln_KNH3, -700, 700))
+        KH2 = np.exp(np.clip(ln_KH2, -700, 700))
 
-        inhib = np.sqrt(np.maximum(KH * PH2[mask], 0.0))
-        denom = (1.0 + inhib) ** n_fixed
+        theta_NH3_term = KNH3 * np.maximum(PNH3[mask], 0.0)
+        theta_H_term = np.sqrt(np.maximum(KH2 * PH2[mask], 0.0))
+        denom = (1.0 + theta_NH3_term + theta_H_term) ** n_fixed
 
         r_pred[mask] = k * np.power(np.maximum(PNH3[mask], EPS), m_fixed) / denom
 
@@ -449,9 +466,12 @@ def residual_joint(params, cat_idx_arr, T_K, PNH3, PH2, r_obs, m_fixed, n_fixed)
     Ea_Ce = params[block_slice(CAT_TO_IDX["Ce"])][1]
     Ea_CoNi = params[block_slice(CAT_TO_IDX["CoNi"])][1]
 
-    dH_La = params[block_slice(CAT_TO_IDX["La"])][3]
-    dH_Ce = params[block_slice(CAT_TO_IDX["Ce"])][3]
-    dH_CoNi = params[block_slice(CAT_TO_IDX["CoNi"])][3]
+    dH_NH3_La = params[block_slice(CAT_TO_IDX["La"])][3]
+    dH_NH3_Ce = params[block_slice(CAT_TO_IDX["Ce"])][3]
+    dH_NH3_CoNi = params[block_slice(CAT_TO_IDX["CoNi"])][3]
+    dH_H2_La = params[block_slice(CAT_TO_IDX["La"])][5]
+    dH_H2_Ce = params[block_slice(CAT_TO_IDX["Ce"])][5]
+    dH_H2_CoNi = params[block_slice(CAT_TO_IDX["CoNi"])][5]
 
     pen_ea = np.concatenate([
         bound_penalty_residual(Ea_La, EA_SOFT_LOW, EA_SOFT_HIGH, EA_RANGE_SIGMA, EA_RANGE_MULTIPLIER),
@@ -460,9 +480,12 @@ def residual_joint(params, cat_idx_arr, T_K, PNH3, PH2, r_obs, m_fixed, n_fixed)
     ])
 
     pen_dh = np.concatenate([
-        bound_penalty_residual(dH_La, DH_SOFT_LOW, DH_SOFT_HIGH, DH_RANGE_SIGMA, DH_RANGE_MULTIPLIER),
-        bound_penalty_residual(dH_Ce, DH_SOFT_LOW, DH_SOFT_HIGH, DH_RANGE_SIGMA, DH_RANGE_MULTIPLIER),
-        bound_penalty_residual(dH_CoNi, DH_SOFT_LOW, DH_SOFT_HIGH, DH_RANGE_SIGMA, DH_RANGE_MULTIPLIER)
+        bound_penalty_residual(dH_NH3_La, DH_SOFT_LOW, DH_SOFT_HIGH, DH_RANGE_SIGMA, DH_RANGE_MULTIPLIER),
+        bound_penalty_residual(dH_NH3_Ce, DH_SOFT_LOW, DH_SOFT_HIGH, DH_RANGE_SIGMA, DH_RANGE_MULTIPLIER),
+        bound_penalty_residual(dH_NH3_CoNi, DH_SOFT_LOW, DH_SOFT_HIGH, DH_RANGE_SIGMA, DH_RANGE_MULTIPLIER),
+        bound_penalty_residual(dH_H2_La, DH_SOFT_LOW, DH_SOFT_HIGH, DH_RANGE_SIGMA, DH_RANGE_MULTIPLIER),
+        bound_penalty_residual(dH_H2_Ce, DH_SOFT_LOW, DH_SOFT_HIGH, DH_RANGE_SIGMA, DH_RANGE_MULTIPLIER),
+        bound_penalty_residual(dH_H2_CoNi, DH_SOFT_LOW, DH_SOFT_HIGH, DH_RANGE_SIGMA, DH_RANGE_MULTIPLIER)
     ])
 
     pen_pool = ea_mean_pool_penalty_residual(Ea_La, Ea_Ce, Ea_CoNi)
@@ -494,10 +517,12 @@ def fit_joint_global(df, m_fixed, n_fixed, x0_base=None):
         if i != 0:
             for ci in range(len(CAT_ORDER)):
                 sl = block_slice(ci)
-                x0[sl][0] += rng.uniform(-2.5, 2.5)
-                x0[sl][1] += rng.uniform(-20e3, 20e3)
-                x0[sl][2] += rng.uniform(-2.5, 2.5)
-                x0[sl][3] += rng.uniform(-25e3, 25e3)
+                x0[sl][0] += rng.uniform(-2.5, 2.5)      # lnA
+                x0[sl][1] += rng.uniform(-20e3, 20e3)    # Ea
+                x0[sl][2] += rng.uniform(-2.5, 2.5)      # lnKNH30
+                x0[sl][3] += rng.uniform(-25e3, 25e3)    # dH_NH3
+                x0[sl][4] += rng.uniform(-2.5, 2.5)      # lnKH20
+                x0[sl][5] += rng.uniform(-25e3, 25e3)    # dH_H2
             x0 = np.clip(x0, lb, ub)
 
         res = least_squares(
@@ -692,8 +717,8 @@ def save_final_outputs(df, params, se, score, out_root, m_final, n_final):
     for cat in CAT_ORDER:
         ci = CAT_TO_IDX[cat]
         sl = block_slice(ci)
-        lnA, Ea, lnKH0, dH = params[sl]
-        SE_lnA, SE_Ea, SE_lnKH0, SE_dH = se[sl]
+        lnA, Ea, lnKNH30, dH_NH3, lnKH20, dH_H2 = params[sl]
+        SE_lnA, SE_Ea, SE_lnKNH30, SE_dH_NH3, SE_lnKH20, SE_dH_H2 = se[sl]
 
         sub = df_out[df_out["catalyst"] == cat].copy()
         metrics = calc_metrics(sub["r_exp"].to_numpy(), sub["r_calc"].to_numpy())
@@ -708,12 +733,18 @@ def save_final_outputs(df, params, se, score, out_root, m_final, n_final):
             "SE_Ea_J_per_mol": SE_Ea,
             "Ea_kJ_per_mol": Ea / 1000.0,
             "SE_Ea_kJ_per_mol": SE_Ea / 1000.0,
-            "lnKH0": lnKH0,
-            "SE_lnKH0": SE_lnKH0,
-            "dH_J_per_mol": dH,
-            "SE_dH_J_per_mol": SE_dH,
-            "dH_kJ_per_mol": dH / 1000.0,
-            "SE_dH_kJ_per_mol": SE_dH / 1000.0,
+            "lnKNH30": lnKNH30,
+            "SE_lnKNH30": SE_lnKNH30,
+            "dH_NH3_J_per_mol": dH_NH3,
+            "SE_dH_NH3_J_per_mol": SE_dH_NH3,
+            "dH_NH3_kJ_per_mol": dH_NH3 / 1000.0,
+            "SE_dH_NH3_kJ_per_mol": SE_dH_NH3 / 1000.0,
+            "lnKH20": lnKH20,
+            "SE_lnKH20": SE_lnKH20,
+            "dH_H2_J_per_mol": dH_H2,
+            "SE_dH_H2_J_per_mol": SE_dH_H2,
+            "dH_H2_kJ_per_mol": dH_H2 / 1000.0,
+            "SE_dH_H2_kJ_per_mol": SE_dH_H2 / 1000.0,
             "objective_score_final": score,
             **metrics
         })
@@ -726,8 +757,10 @@ def save_final_outputs(df, params, se, score, out_root, m_final, n_final):
             "n_final": n_final,
             "Ea_kJ_per_mol": Ea / 1000.0,
             "SE_Ea_kJ_per_mol": SE_Ea / 1000.0,
-            "dH_kJ_per_mol": dH / 1000.0,
-            "SE_dH_kJ_per_mol": SE_dH / 1000.0,
+            "dH_NH3_kJ_per_mol": dH_NH3 / 1000.0,
+            "SE_dH_NH3_kJ_per_mol": SE_dH_NH3 / 1000.0,
+            "dH_H2_kJ_per_mol": dH_H2 / 1000.0,
+            "SE_dH_H2_kJ_per_mol": SE_dH_H2 / 1000.0,
             "overall_RMSE": metrics["RMSE"],
             "overall_MAE": metrics["MAE"],
             "overall_MAPE_%": metrics["MAPE_%"],
@@ -750,7 +783,8 @@ def save_final_outputs(df, params, se, score, out_root, m_final, n_final):
             subT = sub.loc[mask].copy()
 
             kT = k_of_T(lnA, Ea, T_K)
-            KHT = KH_of_T(lnKH0, dH, T_K)
+            KNH3T = Kads_of_T(lnKNH30, dH_NH3, T_K)
+            KH2T = Kads_of_T(lnKH20, dH_H2, T_K)
             sub_metrics = calc_metrics(subT["r_exp"].to_numpy(), subT["r_calc"].to_numpy())
 
             temp_fit_rows.append({
@@ -761,8 +795,10 @@ def save_final_outputs(df, params, se, score, out_root, m_final, n_final):
                 "n_feed_points": int(np.sum(subT["feed_flag"])),
                 "ln_k_global": np.log(np.maximum(kT, EPS)),
                 "k(T)_global": kT,
-                "ln_KH_global": np.log(np.maximum(KHT, EPS)),
-                "KH(T)_global": KHT,
+                "ln_KNH3_global": np.log(np.maximum(KNH3T, EPS)),
+                "KNH3(T)_global": KNH3T,
+                "ln_KH2_global": np.log(np.maximum(KH2T, EPS)),
+                "KH2(T)_global": KH2T,
                 **sub_metrics
             })
 
@@ -771,15 +807,17 @@ def save_final_outputs(df, params, se, score, out_root, m_final, n_final):
         temp_df["n_final"] = n_final
         temp_df["lnA_global"] = lnA
         temp_df["Ea_kJ_per_mol_global"] = Ea / 1000.0
-        temp_df["lnKH0_global"] = lnKH0
-        temp_df["dH_kJ_per_mol_global"] = dH / 1000.0
+        temp_df["lnKNH30_global"] = lnKNH30
+        temp_df["dH_NH3_kJ_per_mol_global"] = dH_NH3 / 1000.0
+        temp_df["lnKH20_global"] = lnKH20
+        temp_df["dH_H2_kJ_per_mol_global"] = dH_H2 / 1000.0
         temp_rows_all.append(temp_df)
 
         cat_out = os.path.join(out_root, cat)
         os.makedirs(cat_out, exist_ok=True)
 
         sub.to_csv(os.path.join(cat_out, f"{cat}_predictions_final.csv"), index=False)
-        temp_df.to_csv(os.path.join(cat_out, f"{cat}_k_KH_by_temperature_final.csv"), index=False)
+        temp_df.to_csv(os.path.join(cat_out, f"{cat}_k_KNH3_KH2_by_temperature_final.csv"), index=False)
 
         parity_plot_loglog(
             title=f"Parity plot - {cat} (alternating final fit)",
@@ -815,12 +853,15 @@ def save_final_outputs(df, params, se, score, out_root, m_final, n_final):
 
         invT = 1.0 / temp_df["T_K"].to_numpy()
         lnk = np.log(np.maximum(temp_df["k(T)_global"].to_numpy(), EPS))
-        lnKH = np.log(np.maximum(temp_df["KH(T)_global"].to_numpy(), EPS))
+        lnKNH3 = np.log(np.maximum(temp_df["KNH3(T)_global"].to_numpy(), EPS))
+        lnKH2 = np.log(np.maximum(temp_df["KH2(T)_global"].to_numpy(), EPS))
 
         a_k = lnA
         b_k = -Ea / R
-        a_h = lnKH0
-        b_h = -dH / R
+        a_nh3 = lnKNH30
+        b_nh3 = -dH_NH3 / R
+        a_h2 = lnKH20
+        b_h2 = -dH_H2 / R
 
         arrhenius_plot(
             invT, lnk, a_k, b_k,
@@ -830,16 +871,23 @@ def save_final_outputs(df, params, se, score, out_root, m_final, n_final):
         )
 
         arrhenius_plot(
-            invT, lnKH, a_h, b_h,
-            title=f"van't Hoff plot - {cat}",
-            ylabel="ln KH",
-            out_png=os.path.join(cat_out, f"{cat}_VantHoff_lnKH_vs_1overT.png")
+            invT, lnKNH3, a_nh3, b_nh3,
+            title=f"van't Hoff plot KNH3 - {cat}",
+            ylabel="ln KNH3",
+            out_png=os.path.join(cat_out, f"{cat}_VantHoff_lnKNH3_vs_1overT.png")
+        )
+
+        arrhenius_plot(
+            invT, lnKH2, a_h2, b_h2,
+            title=f"van't Hoff plot KH2 - {cat}",
+            ylabel="ln KH2",
+            out_png=os.path.join(cat_out, f"{cat}_VantHoff_lnKH2_vs_1overT.png")
         )
 
     pd.DataFrame(param_rows).to_csv(os.path.join(out_root, "ALL_CATALYSTS_final_parameters.csv"), index=False)
     pd.DataFrame(summary_rows).to_csv(os.path.join(out_root, "ALL_CATALYSTS_final_summary.csv"), index=False)
     pd.concat(temp_rows_all, ignore_index=True).to_csv(
-        os.path.join(out_root, "ALL_CATALYSTS_k_KH_by_temperature_final.csv"),
+        os.path.join(out_root, "ALL_CATALYSTS_k_KNH3_KH2_by_temperature_final.csv"),
         index=False
     )
 
