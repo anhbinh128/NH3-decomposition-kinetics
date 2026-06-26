@@ -1,6 +1,5 @@
 # NH3-decomposition-kinetics
-Kinetic modeling and Langmuir–Hinshelwood fitting for NH3 decomposition over promoted Co–Ni catalysts.
-
+Semi-empirical Langmuir-Hinshelwood model for quantifying hydrogen poisoning during ammonia decomposition over spinel-derived Co-Ni catalysts.
 This repository contains the Python code used for fitting the semi-empirical Langmuir–Hinshelwood kinetic model for ammonia decomposition.
 
 ## File
